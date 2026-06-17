@@ -56,6 +56,13 @@ swift Tools/palettewright-cli.swift audit path/to/tokens-or-css-file.css --json
 - Modern space-separated RGB syntax
 - `hsl()`
 - `hsla()`
+- `hwb()`
+- `lab()`
+- `lch()`
+- `oklab()`
+- `oklch()`
+- `color(display-p3 ...)`
+- Structured JSON color objects using `hex`, `red` / `green` / `blue`, or `components` with `colorSpace`, `space`, or `model`
 
 Alpha channels are accepted during extraction but ignored for contrast calculations. The CLI audits the rendered RGB color values.
 
@@ -113,7 +120,7 @@ Use `--json` if you want to capture results and render them in a custom report.
 
 The CLI is intentionally narrower than the PaletteWright app. It is best for automated contrast checks on text-based files. The app remains the richer authoring tool for importing palettes, generating perceptual ramps, repairing semantic contrast, creating Figma handoff, and exporting framework-specific formats.
 
-The CLI currently extracts hex, RGB, and HSL-style colors. It does not yet parse OKLCH, Lab/LCH, Display-P3, CSS custom property references, computed CSS values, images, or live websites.
+The CLI currently extracts the same text color syntaxes used by PaletteWright's paste, file, and website import paths: hex, RGB, HSL, HWB, Lab/LCH, OKLab/OKLCH, Display-P3, and common structured JSON color objects. It does not parse CSS custom property references, computed CSS values, images, or live websites.
 
 ## Recommended User Distribution
 
