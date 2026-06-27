@@ -4,10 +4,12 @@
 //  PaletteWright
 //
 //  Created by Michael Stebel on 5/19/26.
-//  Updated by Michael on 5/29/26.
+//  Updated by Michael on 6/27/26.
 //
 
 import Foundation
+
+let cliVersion = "1.1"
 
 /// Represents a parsed OKLab color.
 struct OKLab {
@@ -305,6 +307,7 @@ enum ContrastGate: String {
 enum Command {
     case audit(filePath: String, gate: ContrastGate, json: Bool)
     case extract(filePath: String, json: Bool)
+    case version
     case help
 }
 
@@ -345,11 +348,13 @@ func printUsage(to stream: UnsafeMutablePointer<FILE> = stdout) {
         Usage:
           swift Tools/palettewright-cli.swift audit <file> [--gate aa|aaa|large] [--json]
           swift Tools/palettewright-cli.swift extract <file> [--json]
+          swift Tools/palettewright-cli.swift version
           swift Tools/palettewright-cli.swift help
 
         Commands:
           audit    Extract colors and report WCAG contrast coverage.
           extract  List unique colors discovered in a CSS/JSON/text file.
+          version  Print the CLI version.
 
         Supported color syntax:
           #RGB, #RGBA, #RRGGBB, #RRGGBBAA
@@ -376,6 +381,8 @@ func parseCommand(_ arguments: [String]) throws -> Command {
     switch command {
     case "help", "--help", "-h":
         return .help
+    case "version", "--version", "-v":
+        return .version
     case "audit":
         return try parseAuditCommand(Array(arguments.dropFirst()))
     case "extract":
@@ -1290,11 +1297,19 @@ func printJSON(_ value: Any) {
     print(string)
 }
 
+/// Prints the CLI version.
+func printVersion() {
+    print("PaletteWright CLI \(cliVersion)")
+}
+
 do {
     let command = try parseCommand(Array(CommandLine.arguments.dropFirst()))
     switch command {
     case .help:
         printUsage()
+        exit(0)
+    case .version:
+        printVersion()
         exit(0)
     case .audit(let filePath, let gate, let json):
         exit(try runAudit(filePath: filePath, gate: gate, json: json))

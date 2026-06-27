@@ -15,9 +15,16 @@ The script can be run directly with Swift from the PaletteWright project root:
 
 ```sh
 swift Tools/palettewright-cli.swift help
+swift Tools/palettewright-cli.swift version
 ```
 
 ## Commands
+
+Print the CLI version:
+
+```sh
+swift Tools/palettewright-cli.swift version
+```
 
 Extract unique colors:
 
