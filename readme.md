@@ -128,14 +128,3 @@ Use `--json` if you want to capture results and render them in a custom report.
 The CLI is intentionally narrower than the PaletteWright app. It is best for automated contrast checks on text-based files. The app remains the richer authoring tool for importing palettes, generating perceptual ramps, repairing semantic contrast, creating Figma handoff, and exporting framework-specific formats.
 
 The CLI currently extracts the same text color syntaxes used by PaletteWright's paste, file, and website import paths: hex, RGB, HSL, HWB, Lab/LCH, OKLab/OKLCH, Display-P3, and common structured JSON color objects. It does not parse CSS custom property references, computed CSS values, images, or live websites.
-
-## Recommended User Distribution
-
-For early release, the best user-facing path is:
-
-1. Include this README in the project and link to it from the in-app User Guide, the Mac app's Tools > CLI Utility sheet, and the support website.
-2. Offer the script as an optional developer download from the PaletteWright support site or a public GitHub release.
-3. For non-technical users, keep CLI guidance framed as an optional CI/developer tool, not as part of the core app workflow.
-4. For a polished public release, ship a notarized universal macOS binary named `palettewright` in a `.zip`, alongside this source script, checksum, and example files.
-
-Avoid trying to install the CLI from the App Store app itself. App Store apps should not place command-line tools into locations such as `/usr/local/bin`; an external download or repository release is cleaner and easier for users to update.
