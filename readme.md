@@ -1,6 +1,6 @@
 # PaletteWright CLI
 
-`palettewright-cli.swift` is a lightweight command-line companion for PaletteWright. It extracts colors from CSS, JSON, token files, or plain text, then audits every ordered foreground/background pair against WCAG contrast gates.
+`palettewright-cli.swift` is PaletteWright's deterministic command-line compiler and CI companion. It scans, compiles, checks, diffs, repairs, and watches text-based color sources.
 
 Use it when you want a repeatable color check in a design-system repo, app repo, website repo, or CI workflow.
 
@@ -19,6 +19,19 @@ swift Tools/palettewright-cli.swift version
 ```
 
 ## Commands
+
+The 2.0 workflow commands are:
+
+```sh
+swift Tools/palettewright-cli.swift scan Sources --json
+swift Tools/palettewright-cli.swift compile tokens.json --format css --output Generated/colors.css
+swift Tools/palettewright-cli.swift check tokens.css --gate aa --sarif > palettewright.sarif
+swift Tools/palettewright-cli.swift diff before.css after.css --json
+swift Tools/palettewright-cli.swift fix tokens.css --output Generated/tokens-fixed.css
+swift Tools/palettewright-cli.swift watch Sources --format json --output Generated/colors.json
+```
+
+`compile` sorts normalized colors before naming them, so unchanged input always produces byte-for-byte stable output. `fix` never overwrites its source; pass `--output` to write a reviewed repair candidate.
 
 Print the CLI version:
 
@@ -87,8 +100,8 @@ Alpha channels are accepted during extraction but ignored for contrast calculati
 
 | Code | Meaning |
 | ---: | --- |
-| `0` | Command succeeded. For `audit`, every color pair met the selected gate. |
-| `1` | Runtime failure, insufficient colors for audit, no extractable colors, or audit gate failure. |
+| `0` | Command succeeded. For `audit` or `check`, every color pair met the selected gate. |
+| `1` | Runtime failure, insufficient colors, no extractable colors, or an audit/check gate failure. |
 | `2` | Invalid arguments. |
 
 These exit codes are intended for CI. A failing audit exits with `1`, so a build step can stop when a palette or token file does not meet the selected gate.
@@ -125,6 +138,6 @@ Use `--json` if you want to capture results and render them in a custom report.
 
 ## Current Scope
 
-The CLI is intentionally narrower than the PaletteWright app. It is best for automated contrast checks on text-based files. The app remains the richer authoring tool for importing palettes, generating perceptual ramps, repairing semantic contrast, creating Figma handoff, and exporting framework-specific formats.
+The CLI is the deterministic repository and CI companion to PaletteWright 2.0. It scans supported source trees, compiles normalized color output, checks contrast with text, JSON, or SARIF reporting, diffs color sets, writes non-destructive repair candidates, and watches folders for changes. The app remains the visual authoring surface for capture, perceptual palette construction, semantic role editing, live component previews, and Figma handoff.
 
-The CLI currently extracts the same text color syntaxes used by PaletteWright's paste, file, and website import paths: hex, RGB, HSL, HWB, Lab/LCH, OKLab/OKLCH, Display-P3, and common structured JSON color objects. It does not parse CSS custom property references, computed CSS values, images, or live websites.
+The CLI extracts the same text color syntaxes used by PaletteWright's paste, file, and website import paths: hex, RGB, HSL, HWB, Lab/LCH, OKLab/OKLCH, Display-P3, and common structured JSON color objects. It does not evaluate runtime CSS custom-property references, computed browser styles, images, or live websites.

@@ -9,7 +9,7 @@
 
 import Foundation
 
-let cliVersion = "1.1"
+let cliVersion = "2.0"
 
 /// Represents a parsed OKLab color.
 struct OKLab {
@@ -307,6 +307,12 @@ enum ContrastGate: String {
 enum Command {
     case audit(filePath: String, gate: ContrastGate, json: Bool)
     case extract(filePath: String, json: Bool)
+    case scan(path: String, json: Bool)
+    case compile(filePath: String, format: String, outputPath: String)
+    case check(filePath: String, gate: ContrastGate, sarif: Bool, json: Bool)
+    case diff(firstPath: String, secondPath: String, json: Bool)
+    case fix(filePath: String, outputPath: String?, json: Bool)
+    case watch(path: String, format: String, outputPath: String)
     case version
     case help
 }
@@ -319,6 +325,7 @@ enum CLIError: LocalizedError {
     case unknownOption(String)
     case missingOptionValue(String)
     case invalidGate(String)
+    case invalidFormat(String)
 
     /// Returns the user-facing error message.
     var errorDescription: String? {
@@ -335,6 +342,8 @@ enum CLIError: LocalizedError {
             return "Missing value for \(option)."
         case .invalidGate(let value):
             return "Invalid gate '\(value)'. Use large, aa, or aaa."
+        case .invalidFormat(let value):
+            return "Invalid format '\(value)'. Use css or json."
         }
     }
 }
@@ -348,12 +357,24 @@ func printUsage(to stream: UnsafeMutablePointer<FILE> = stdout) {
         Usage:
           swift Tools/palettewright-cli.swift audit <file> [--gate aa|aaa|large] [--json]
           swift Tools/palettewright-cli.swift extract <file> [--json]
+          swift Tools/palettewright-cli.swift scan <folder> [--json]
+          swift Tools/palettewright-cli.swift compile <file> --format css|json --output <file>
+          swift Tools/palettewright-cli.swift check <file> [--gate aa|aaa|large] [--json|--sarif]
+          swift Tools/palettewright-cli.swift diff <before> <after> [--json]
+          swift Tools/palettewright-cli.swift fix <file> [--output <file>] [--json]
+          swift Tools/palettewright-cli.swift watch <file-or-folder> --format css|json --output <file>
           swift Tools/palettewright-cli.swift version
           swift Tools/palettewright-cli.swift help
 
         Commands:
           audit    Extract colors and report WCAG contrast coverage.
           extract  List unique colors discovered in a CSS/JSON/text file.
+          scan     Recursively inventory source colors and their locations.
+          compile  Produce deterministic CSS or JSON token output.
+          check    Gate color contrast with JSON or SARIF output for CI.
+          diff     Compare two token sources by normalized color value.
+          fix      Generate a deterministic high-contrast repair palette.
+          watch    Recompile whenever a connected file or folder changes.
           version  Print the CLI version.
 
         Supported color syntax:
@@ -363,8 +384,8 @@ func printUsage(to stream: UnsafeMutablePointer<FILE> = stdout) {
           JSON hex/RGB/component color objects
 
         Exit codes:
-          0  Command succeeded. For audit, every pair met the selected gate.
-          1  Runtime failure or audit gate failure.
+          0  Command succeeded. For audit/check, every pair met the selected gate.
+          1  Runtime failure or audit/check gate failure.
           2  Invalid arguments.
 
         """,
@@ -387,6 +408,18 @@ func parseCommand(_ arguments: [String]) throws -> Command {
         return try parseAuditCommand(Array(arguments.dropFirst()))
     case "extract":
         return try parseExtractCommand(Array(arguments.dropFirst()))
+    case "scan":
+        return try parseScanCommand(Array(arguments.dropFirst()))
+    case "compile":
+        return try parseCompileCommand(Array(arguments.dropFirst()), watch: false)
+    case "check":
+        return try parseCheckCommand(Array(arguments.dropFirst()))
+    case "diff":
+        return try parseDiffCommand(Array(arguments.dropFirst()))
+    case "fix":
+        return try parseFixCommand(Array(arguments.dropFirst()))
+    case "watch":
+        return try parseCompileCommand(Array(arguments.dropFirst()), watch: true)
     default:
         throw CLIError.unknownCommand(command)
     }
@@ -453,6 +486,100 @@ func parseExtractCommand(_ arguments: [String]) throws -> Command {
     }
 
     return .extract(filePath: filePath, json: json)
+}
+
+func parseScanCommand(_ arguments: [String]) throws -> Command {
+    var path: String?
+    var json = false
+    for argument in arguments {
+        if argument == "--json" { json = true }
+        else if argument.hasPrefix("-") { throw CLIError.unknownOption(argument) }
+        else { path = argument }
+    }
+    guard let path else { throw CLIError.missingFile("scan") }
+    return .scan(path: path, json: json)
+}
+
+func parseCompileCommand(_ arguments: [String], watch: Bool) throws -> Command {
+    var input: String?
+    var output: String?
+    var format = "css"
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
+        if argument == "--format" || argument == "--output" {
+            guard index + 1 < arguments.count else { throw CLIError.missingOptionValue(argument) }
+            if argument == "--format" { format = arguments[index + 1].lowercased() }
+            else { output = arguments[index + 1] }
+            index += 1
+        } else if argument.hasPrefix("-") {
+            throw CLIError.unknownOption(argument)
+        } else {
+            input = argument
+        }
+        index += 1
+    }
+    guard ["css", "json"].contains(format) else { throw CLIError.invalidFormat(format) }
+    guard let input else { throw CLIError.missingFile(watch ? "watch" : "compile") }
+    guard let output else { throw CLIError.missingOptionValue("--output") }
+    return watch
+        ? .watch(path: input, format: format, outputPath: output)
+        : .compile(filePath: input, format: format, outputPath: output)
+}
+
+func parseCheckCommand(_ arguments: [String]) throws -> Command {
+    var filePath: String?
+    var gate = ContrastGate.aa
+    var sarif = false
+    var json = false
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
+        if argument == "--gate" {
+            guard index + 1 < arguments.count else { throw CLIError.missingOptionValue(argument) }
+            guard let value = ContrastGate(rawValue: arguments[index + 1].lowercased()) else {
+                throw CLIError.invalidGate(arguments[index + 1])
+            }
+            gate = value
+            index += 1
+        } else if argument == "--sarif" { sarif = true }
+        else if argument == "--json" { json = true }
+        else if argument.hasPrefix("-") { throw CLIError.unknownOption(argument) }
+        else { filePath = argument }
+        index += 1
+    }
+    guard let filePath else { throw CLIError.missingFile("check") }
+    return .check(filePath: filePath, gate: gate, sarif: sarif, json: json)
+}
+
+func parseDiffCommand(_ arguments: [String]) throws -> Command {
+    let json = arguments.contains("--json")
+    let paths = arguments.filter { !$0.hasPrefix("-") }
+    guard paths.count >= 2 else { throw CLIError.missingFile("diff") }
+    for argument in arguments where argument.hasPrefix("-") && argument != "--json" {
+        throw CLIError.unknownOption(argument)
+    }
+    return .diff(firstPath: paths[0], secondPath: paths[1], json: json)
+}
+
+func parseFixCommand(_ arguments: [String]) throws -> Command {
+    var filePath: String?
+    var output: String?
+    var json = false
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
+        if argument == "--output" {
+            guard index + 1 < arguments.count else { throw CLIError.missingOptionValue(argument) }
+            output = arguments[index + 1]
+            index += 1
+        } else if argument == "--json" { json = true }
+        else if argument.hasPrefix("-") { throw CLIError.unknownOption(argument) }
+        else { filePath = argument }
+        index += 1
+    }
+    guard let filePath else { throw CLIError.missingFile("fix") }
+    return .fix(filePath: filePath, outputPath: output, json: json)
 }
 
 /// Reads a UTF-8 text file for color extraction.
@@ -1272,6 +1399,159 @@ func runAudit(filePath: String, gate: ContrastGate, json: Bool) throws -> Int32 
     return didPass ? 0 : 1
 }
 
+func readableSourceFiles(at path: String) throws -> [(URL, String)] {
+    let root = URL(fileURLWithPath: path).standardizedFileURL
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
+        throw CLIError.unreadableFile(root.path)
+    }
+    if !isDirectory.boolValue { return [try readTextFile(at: root.path)] }
+    let extensions = Set(["css", "scss", "sass", "less", "json", "jsonc", "tokens", "swift", "js", "jsx", "ts", "tsx", "html", "xml", "txt", "md"])
+    let urls = ((try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [])
+    let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles, .skipsPackageDescendants])
+    let recursive = (enumerator?.allObjects as? [URL]) ?? urls
+    return recursive
+        .filter { extensions.contains($0.pathExtension.lowercased()) }
+        .sorted { $0.path < $1.path }
+        .compactMap { url in
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+            return (url, text)
+        }
+}
+
+func uniqueColors(in files: [(URL, String)]) -> [RGB] {
+    Array(Set(files.flatMap { extractColorMatches(from: $0.1).map(\.color) })).sorted { $0.hex < $1.hex }
+}
+
+func runScan(path: String, json: Bool) throws -> Int32 {
+    let root = URL(fileURLWithPath: path).standardizedFileURL
+    let files = try readableSourceFiles(at: path)
+    let rows: [[String: Any]] = files.flatMap { url, text in
+        extractColorMatches(from: text).map { match in
+            [
+                "file": url.path.replacingOccurrences(of: root.path + "/", with: ""),
+                "hex": match.color.hex,
+                "source": match.source,
+                "line": match.line,
+                "column": match.column
+            ]
+        }
+    }
+    if json {
+        printJSON(["root": root.path, "fileCount": files.count, "matchCount": rows.count, "colors": rows])
+    } else {
+        print("PaletteWright scan: \(root.path)")
+        print("Files: \(files.count) · Color matches: \(rows.count)")
+        for row in rows {
+            print("\(row["hex"] ?? "")  \(row["file"] ?? ""):\(row["line"] ?? 0):\(row["column"] ?? 0)")
+        }
+    }
+    return rows.isEmpty ? 1 : 0
+}
+
+func compiledText(colors: [RGB], format: String) -> String {
+    if format == "json" {
+        let values = Dictionary(uniqueKeysWithValues: colors.enumerated().map { index, color in
+            (String(format: "color-%03d", index + 1), color.hex)
+        })
+        guard let data = try? JSONSerialization.data(withJSONObject: ["color": values], options: [.prettyPrinted, .sortedKeys]) else { return "{}\n" }
+        return String(data: data, encoding: .utf8)! + "\n"
+    }
+    let rows = colors.enumerated().map { index, color in
+        "  --color-\(String(format: "%03d", index + 1)): \(color.hex);"
+    }
+    return ([":root {"] + rows + ["}", ""]).joined(separator: "\n")
+}
+
+@discardableResult
+func runCompile(filePath: String, format: String, outputPath: String) throws -> Int32 {
+    let files = try readableSourceFiles(at: filePath)
+    let colors = uniqueColors(in: files)
+    guard !colors.isEmpty else { return 1 }
+    let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
+    try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try compiledText(colors: colors, format: format).write(to: outputURL, atomically: true, encoding: .utf8)
+    print("Compiled \(colors.count) deterministic tokens to \(outputURL.path)")
+    return 0
+}
+
+func runCheck(filePath: String, gate: ContrastGate, sarif: Bool, json: Bool) throws -> Int32 {
+    guard sarif else { return try runAudit(filePath: filePath, gate: gate, json: json) }
+    let (url, text) = try readTextFile(at: filePath)
+    let matches = extractColorMatches(from: text)
+    guard let background = matches.first else { printJSON(["version": "2.1.0", "runs": []]); return 1 }
+    let failures = matches.dropFirst().filter { $0.color.contrast(with: background.color) < gate.threshold }
+    let results: [[String: Any]] = failures.map { match in
+        [
+            "ruleId": "PW001",
+            "level": "error",
+            "message": ["text": "\(match.color.hex) has insufficient contrast against \(background.color.hex)."],
+            "locations": [["physicalLocation": ["artifactLocation": ["uri": url.path], "region": ["startLine": max(match.line, 1), "startColumn": max(match.column, 1)]]]]
+        ]
+    }
+    printJSON([
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [["tool": ["driver": ["name": "PaletteWright", "version": cliVersion, "rules": [["id": "PW001", "shortDescription": ["text": "Insufficient color contrast"]]]]], "results": results]]
+    ])
+    return failures.isEmpty ? 0 : 1
+}
+
+func runDiff(firstPath: String, secondPath: String, json: Bool) throws -> Int32 {
+    let before = Set(uniqueColors(in: try readableSourceFiles(at: firstPath)).map(\.hex))
+    let after = Set(uniqueColors(in: try readableSourceFiles(at: secondPath)).map(\.hex))
+    let added = Array(after.subtracting(before)).sorted()
+    let removed = Array(before.subtracting(after)).sorted()
+    if json { printJSON(["added": added, "removed": removed, "changed": !added.isEmpty || !removed.isEmpty]) }
+    else {
+        print("PaletteWright diff")
+        for color in added { print("+ \(color)") }
+        for color in removed { print("- \(color)") }
+        if added.isEmpty && removed.isEmpty { print("No normalized color changes.") }
+    }
+    return added.isEmpty && removed.isEmpty ? 0 : 1
+}
+
+func runFix(filePath: String, outputPath: String?, json: Bool) throws -> Int32 {
+    let (url, text) = try readTextFile(at: filePath)
+    let matches = extractColorMatches(from: text)
+    guard let background = matches.first else { return 1 }
+    let black = RGB(hex: "#000000")
+    let white = RGB(hex: "#FFFFFF")
+    var replacements: [String: String] = [:]
+    for match in matches.dropFirst() where match.color.contrast(with: background.color) < 4.5 {
+        let repair = black.contrast(with: background.color) >= white.contrast(with: background.color) ? black : white
+        replacements[match.source] = repair.hex
+    }
+    if let outputPath {
+        var repaired = text
+        for source in replacements.keys.sorted() { repaired = repaired.replacingOccurrences(of: source, with: replacements[source]!) }
+        let outputURL = URL(fileURLWithPath: outputPath)
+        try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try repaired.write(to: outputURL, atomically: true, encoding: .utf8)
+    }
+    if json { printJSON(["file": url.path, "background": background.color.hex, "replacements": replacements, "output": (outputPath as Any?) ?? NSNull()]) }
+    else {
+        print("PaletteWright fix: \(replacements.count) suggested replacement(s)")
+        for key in replacements.keys.sorted() { print("\(key) -> \(replacements[key]!)") }
+    }
+    return 0
+}
+
+func runWatch(path: String, format: String, outputPath: String) throws -> Int32 {
+    var lastSignature = ""
+    print("Watching \(path). Press Control-C to stop.")
+    while true {
+        let files = try readableSourceFiles(at: path)
+        let signature = files.map { "\($0.0.path):\($0.1.hashValue)" }.joined(separator: "|")
+        if signature != lastSignature {
+            lastSignature = signature
+            _ = try runCompile(filePath: path, format: format, outputPath: outputPath)
+        }
+        Thread.sleep(forTimeInterval: 0.75)
+    }
+}
+
 /// Converts an optional contrast pair into a JSON-friendly dictionary.
 func pairDictionary(_ pair: (foreground: RGB, background: RGB, ratio: Double)?) -> [String: Any] {
     guard let pair else {
@@ -1315,6 +1595,18 @@ do {
         exit(try runAudit(filePath: filePath, gate: gate, json: json))
     case .extract(let filePath, let json):
         exit(try runExtract(filePath: filePath, json: json))
+    case .scan(let path, let json):
+        exit(try runScan(path: path, json: json))
+    case .compile(let filePath, let format, let outputPath):
+        exit(try runCompile(filePath: filePath, format: format, outputPath: outputPath))
+    case .check(let filePath, let gate, let sarif, let json):
+        exit(try runCheck(filePath: filePath, gate: gate, sarif: sarif, json: json))
+    case .diff(let firstPath, let secondPath, let json):
+        exit(try runDiff(firstPath: firstPath, secondPath: secondPath, json: json))
+    case .fix(let filePath, let outputPath, let json):
+        exit(try runFix(filePath: filePath, outputPath: outputPath, json: json))
+    case .watch(let path, let format, let outputPath):
+        exit(try runWatch(path: path, format: format, outputPath: outputPath))
     }
 } catch {
     fputs("Error: \(error.localizedDescription)\n\n", stderr)
