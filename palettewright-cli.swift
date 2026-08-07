@@ -4,7 +4,7 @@
 //  PaletteWright
 //
 //  Created by Michael Stebel on 5/19/26.
-//  Updated by Michael on 6/27/26.
+//  Updated by Michael on 8/7/2026
 //
 
 import Foundation
@@ -1423,13 +1423,32 @@ func uniqueColors(in files: [(URL, String)]) -> [RGB] {
     Array(Set(files.flatMap { extractColorMatches(from: $0.1).map(\.color) })).sorted { $0.hex < $1.hex }
 }
 
+/// Returns a stable path relative to the scan root, even when macOS resolves a
+/// path component through a symlink (for example, `/tmp` to `/private/tmp`).
+func scanRelativePath(for fileURL: URL, rootURL: URL) -> String {
+    let resolvedFileURL = fileURL.resolvingSymlinksInPath().standardizedFileURL
+    let resolvedRootURL = rootURL.resolvingSymlinksInPath().standardizedFileURL
+    let fileComponents = resolvedFileURL.pathComponents
+    let rootComponents = resolvedRootURL.pathComponents
+
+    guard fileComponents.count >= rootComponents.count,
+          Array(fileComponents.prefix(rootComponents.count)) == rootComponents else {
+        return resolvedFileURL.path
+    }
+
+    let relativeComponents = fileComponents.dropFirst(rootComponents.count)
+    return relativeComponents.isEmpty
+        ? resolvedFileURL.lastPathComponent
+        : relativeComponents.joined(separator: "/")
+}
+
 func runScan(path: String, json: Bool) throws -> Int32 {
     let root = URL(fileURLWithPath: path).standardizedFileURL
     let files = try readableSourceFiles(at: path)
     let rows: [[String: Any]] = files.flatMap { url, text in
         extractColorMatches(from: text).map { match in
             [
-                "file": url.path.replacingOccurrences(of: root.path + "/", with: ""),
+                "file": scanRelativePath(for: url, rootURL: root),
                 "hex": match.color.hex,
                 "source": match.source,
                 "line": match.line,
