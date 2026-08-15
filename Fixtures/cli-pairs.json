@@ -1,0 +1,11 @@
+{
+  "pairs": [
+    {
+      "foreground": "foreground",
+      "background": "background",
+      "usage": "normalText",
+      "modes": ["light", "dark", "increasedContrast"],
+      "states": ["default", "hover", "pressed", "focus"]
+    }
+  ]
+}

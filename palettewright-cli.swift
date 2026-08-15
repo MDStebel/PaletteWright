@@ -9,7 +9,12 @@
 
 import Foundation
 
-let cliVersion = "2.0"
+let cliVersion = "2.2"
+
+enum RGBSpace: String, Codable {
+    case sRGB = "sRGB"
+    case displayP3 = "Display-P3"
+}
 
 /// Represents a parsed OKLab color.
 struct OKLab {
@@ -44,12 +49,22 @@ struct RGB: Hashable {
     var red: Double
     var green: Double
     var blue: Double
+    var alpha: Double
+    var space: RGBSpace
 
     /// Creates a color by clamping normalized RGB channels into displayable bounds.
-    init(red: Double, green: Double, blue: Double) {
+    init(
+        red: Double,
+        green: Double,
+        blue: Double,
+        alpha: Double = 1,
+        space: RGBSpace = .sRGB
+    ) {
         self.red = min(max(red, 0), 1)
         self.green = min(max(green, 0), 1)
         self.blue = min(max(blue, 0), 1)
+        self.alpha = min(max(alpha, 0), 1)
+        self.space = space
     }
 
     /// Creates a color from shorthand, RGB, or RGBA hexadecimal text.
@@ -57,21 +72,24 @@ struct RGB: Hashable {
         let cleaned = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
         let normalized: String
         switch cleaned.count {
-        case 3, 4:
-            normalized = String(cleaned.prefix(3).flatMap { [$0, $0] })
+        case 3:
+            normalized = String(cleaned.flatMap { [$0, $0] }) + "FF"
+        case 4:
+            normalized = String(cleaned.flatMap { [$0, $0] })
         case 6:
-            normalized = cleaned
+            normalized = cleaned + "FF"
         case 8:
-            normalized = String(cleaned.prefix(6))
-        default:
             normalized = cleaned
+        default:
+            normalized = cleaned + "FF"
         }
 
         let value = Int(normalized, radix: 16) ?? 0
         self.init(
-            red: Double((value >> 16) & 0xFF) / 255.0,
-            green: Double((value >> 8) & 0xFF) / 255.0,
-            blue: Double(value & 0xFF) / 255.0
+            red: Double((value >> 24) & 0xFF) / 255.0,
+            green: Double((value >> 16) & 0xFF) / 255.0,
+            blue: Double((value >> 8) & 0xFF) / 255.0,
+            alpha: Double(value & 0xFF) / 255.0
         )
     }
 
@@ -87,19 +105,12 @@ struct RGB: Hashable {
 
     /// Calculates relative luminance for contrast checks.
     var luminance: Double {
-        /// Converts an encoded RGB channel into linear light.
-        func channel(_ value: Double) -> Double {
-            value <= 0.03928 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
-        }
-
-        return 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+        CLIColorEngine.relativeLuminance(of: self, in: space)
     }
 
     /// Calculates the WCAG contrast ratio against another RGB color.
     func contrast(with other: RGB) -> Double {
-        let first = luminance
-        let second = other.luminance
-        return (max(first, second) + 0.05) / (min(first, second) + 0.05)
+        CLIColorEngine.evaluate(foreground: self, background: other, usage: .normalText).wcagRatio ?? 0
     }
 
     /// Converts the color into OKLab space.
@@ -243,15 +254,288 @@ struct RGB: Hashable {
     private static let labKappa = 24_389.0 / 27.0
 }
 
+enum AccessibilityMethod: String {
+    case wcag22
+    case apca
+    case both
+
+    var label: String {
+        switch self {
+        case .wcag22: return "WCAG 2.2"
+        case .apca: return "APCA"
+        case .both: return "WCAG 2.2 + APCA"
+        }
+    }
+}
+
+enum AccessibilityDecision: String {
+    case pass
+    case fail
+    case needsReview = "needsReview"
+}
+
+enum AccessibilityUsage: String, Codable {
+    case normalText
+    case largeText
+    case nonTextUI
+    case graphic
+    case decorative
+
+    func threshold(level: ConformanceLevel) -> Double? {
+        switch (self, level) {
+        case (.normalText, .aa): return 4.5
+        case (.normalText, .aaa): return 7
+        case (.largeText, .aa): return 3
+        case (.largeText, .aaa): return 4.5
+        case (.nonTextUI, .aa), (.graphic, .aa): return 3
+        case (.nonTextUI, .aaa), (.graphic, .aaa), (.decorative, _): return nil
+        }
+    }
+
+    var isText: Bool { self == .normalText || self == .largeText }
+}
+
+enum ConformanceLevel: String {
+    case aa
+    case aaa
+}
+
+struct CLIColorEvaluation {
+    var decision: AccessibilityDecision
+    var reviewReason: String?
+    var wcagRatio: Double?
+    var wideGamutRatio: Double?
+    var apcaLc: Double?
+    var apcaFallbackLc: Double?
+    var threshold: Double?
+    var effectiveForeground: RGB?
+    var effectiveBackground: RGB?
+}
+
+enum CLIColorEngine {
+    static let wcagVersion = "WCAG 2.2 (0.04045)"
+    static let apcaLibraryVersion = "apca-w3 0.1.9"
+    static let apcaAlgorithmVersion = "0.0.98G-4g"
+    static let apcaVersion = "\(apcaLibraryVersion) / \(apcaAlgorithmVersion)"
+
+    static func evaluate(
+        foreground: RGB,
+        background: RGB,
+        usage: AccessibilityUsage,
+        level: ConformanceLevel = .aa,
+        unsupportedReason: String? = nil
+    ) -> CLIColorEvaluation {
+        if let unsupportedReason {
+            return review(reason: unsupportedReason, threshold: usage.threshold(level: level))
+        }
+        guard background.alpha >= 1 else {
+            return review(
+                reason: "The complete alpha layer stack is not known.",
+                threshold: usage.threshold(level: level)
+            )
+        }
+
+        let delivery: RGBSpace = foreground.space == .displayP3 || background.space == .displayP3
+            ? .displayP3 : .sRGB
+        let deliveryBackground = converted(background, to: delivery).opaque
+        let deliveryForeground = composite(converted(foreground, to: delivery), over: deliveryBackground)
+        let fallbackBackground = converted(background, to: .sRGB).opaque
+        let fallbackForeground = composite(converted(foreground, to: .sRGB), over: fallbackBackground)
+        let wideRatio = wcagContrast(deliveryForeground, deliveryBackground, in: delivery)
+        let fallbackRatio = wcagContrast(fallbackForeground, fallbackBackground, in: .sRGB)
+        let threshold = usage.threshold(level: level)
+        let decision: AccessibilityDecision
+        if let threshold {
+            let ratios = delivery == .displayP3 ? [wideRatio, fallbackRatio] : [fallbackRatio]
+            decision = ratios.allSatisfy { $0 >= threshold } ? .pass : .fail
+        } else {
+            decision = .pass
+        }
+
+        return CLIColorEvaluation(
+            decision: decision,
+            reviewReason: usage == .decorative ? "Decorative color has no WCAG contrast requirement." : nil,
+            wcagRatio: fallbackRatio,
+            wideGamutRatio: delivery == .displayP3 ? wideRatio : nil,
+            apcaLc: apcaContrast(deliveryForeground, deliveryBackground, in: delivery),
+            apcaFallbackLc: delivery == .displayP3
+                ? apcaContrast(fallbackForeground, fallbackBackground, in: .sRGB) : nil,
+            threshold: threshold,
+            effectiveForeground: deliveryForeground,
+            effectiveBackground: deliveryBackground
+        )
+    }
+
+    static func relativeLuminance(of color: RGB, in destination: RGBSpace) -> Double {
+        let value = converted(color, to: destination)
+        let r = linearized(value.red)
+        let g = linearized(value.green)
+        let b = linearized(value.blue)
+        switch destination {
+        case .sRGB: return 0.2126 * r + 0.7152 * g + 0.0722 * b
+        case .displayP3: return 0.2289745641 * r + 0.6917385218 * g + 0.0792869141 * b
+        }
+    }
+
+    static func wcagContrast(_ foreground: RGB, _ background: RGB, in space: RGBSpace) -> Double {
+        let first = relativeLuminance(of: foreground, in: space)
+        let second = relativeLuminance(of: background, in: space)
+        return (max(first, second) + 0.05) / (min(first, second) + 0.05)
+    }
+
+    static func apcaContrast(_ foreground: RGB, _ background: RGB, in space: RGBSpace) -> Double {
+        var textY = apcaY(foreground, in: space)
+        var backgroundY = apcaY(background, in: space)
+        textY = textY > 0.022 ? textY : textY + pow(0.022 - textY, 1.414)
+        backgroundY = backgroundY > 0.022 ? backgroundY : backgroundY + pow(0.022 - backgroundY, 1.414)
+        guard abs(backgroundY - textY) >= 0.0005 else { return 0 }
+
+        if backgroundY > textY {
+            let raw = (pow(backgroundY, 0.56) - pow(textY, 0.57)) * 1.14
+            return raw < 0.1 ? 0 : (raw - 0.027) * 100
+        }
+        let raw = (pow(backgroundY, 0.65) - pow(textY, 0.62)) * 1.14
+        return raw > -0.1 ? 0 : (raw + 0.027) * 100
+    }
+
+    static func typographyGuidance(lc: Double, usage: AccessibilityUsage) -> String {
+        guard usage.isText else { return "APCA text-readability guidance does not apply to non-text content." }
+        switch abs(lc) {
+        case 90...: return "Body text: about 16 px/400 or 14 px/700."
+        case 75..<90: return "Body text: about 18 px/400 or 14 px/700."
+        case 60..<75: return "Large text: about 24 px/400 or 16 px/700."
+        case 45..<60: return "Display text: about 42 px/400 or 24 px/700."
+        case 30..<45: return "Spot text only; use a much larger or heavier style."
+        case 15..<30: return "Non-text or inactive elements only; not readable text."
+        default: return "Too little contrast for text guidance."
+        }
+    }
+
+    static func converted(_ color: RGB, to destination: RGBSpace) -> RGB {
+        guard color.space != destination else { return color }
+        let r = linearized(color.red)
+        let g = linearized(color.green)
+        let b = linearized(color.blue)
+        let xyz: (x: Double, y: Double, z: Double)
+        switch color.space {
+        case .sRGB:
+            xyz = (
+                0.4123907993 * r + 0.3575843394 * g + 0.1804807884 * b,
+                0.2126390059 * r + 0.7151686788 * g + 0.0721923154 * b,
+                0.0193308187 * r + 0.1191947798 * g + 0.9505321522 * b
+            )
+        case .displayP3:
+            xyz = (
+                0.4865709486 * r + 0.2656676932 * g + 0.1982172852 * b,
+                0.2289745641 * r + 0.6917385218 * g + 0.0792869141 * b,
+                0.0451133819 * g + 1.0439443689 * b
+            )
+        }
+        let linear: (Double, Double, Double)
+        switch destination {
+        case .sRGB:
+            linear = (
+                3.2409699419 * xyz.x - 1.5373831776 * xyz.y - 0.4986107603 * xyz.z,
+                -0.9692436363 * xyz.x + 1.8759675015 * xyz.y + 0.0415550574 * xyz.z,
+                0.0556300797 * xyz.x - 0.2039769589 * xyz.y + 1.0569715142 * xyz.z
+            )
+        case .displayP3:
+            linear = (
+                2.4934969119 * xyz.x - 0.9313836179 * xyz.y - 0.4027107845 * xyz.z,
+                -0.8294889696 * xyz.x + 1.7626640603 * xyz.y + 0.0236246858 * xyz.z,
+                0.0358458302 * xyz.x - 0.0761723893 * xyz.y + 0.9568845240 * xyz.z
+            )
+        }
+        return RGB(
+            red: encoded(linear.0),
+            green: encoded(linear.1),
+            blue: encoded(linear.2),
+            alpha: color.alpha,
+            space: destination
+        )
+    }
+
+    static func composite(_ foreground: RGB, over background: RGB) -> RGB {
+        guard foreground.alpha < 1 else { return foreground.opaque }
+        let bg = converted(background, to: foreground.space)
+        return RGB(
+            red: foreground.red * foreground.alpha + bg.red * (1 - foreground.alpha),
+            green: foreground.green * foreground.alpha + bg.green * (1 - foreground.alpha),
+            blue: foreground.blue * foreground.alpha + bg.blue * (1 - foreground.alpha),
+            space: foreground.space
+        )
+    }
+
+    private static func apcaY(_ color: RGB, in destination: RGBSpace) -> Double {
+        let value = converted(color, to: destination)
+        let r = pow(value.red, 2.4)
+        let g = pow(value.green, 2.4)
+        let b = pow(value.blue, 2.4)
+        switch destination {
+        case .sRGB: return 0.2126729 * r + 0.7151522 * g + 0.0721750 * b
+        case .displayP3: return 0.2289829594805780 * r + 0.6917492625852380 * g + 0.0792677779341829 * b
+        }
+    }
+
+    private static func review(reason: String, threshold: Double?) -> CLIColorEvaluation {
+        CLIColorEvaluation(
+            decision: .needsReview,
+            reviewReason: reason,
+            wcagRatio: nil,
+            wideGamutRatio: nil,
+            apcaLc: nil,
+            apcaFallbackLc: nil,
+            threshold: threshold,
+            effectiveForeground: nil,
+            effectiveBackground: nil
+        )
+    }
+
+    private static func linearized(_ value: Double) -> Double {
+        value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+    }
+
+    private static func encoded(_ value: Double) -> Double {
+        let channel = min(max(value, 0), 1)
+        return channel <= 0.0031308 ? 12.92 * channel : 1.055 * pow(channel, 1 / 2.4) - 0.055
+    }
+}
+
+private extension RGB {
+    var opaque: RGB { RGB(red: red, green: green, blue: blue, space: space) }
+    func withAlpha(_ alpha: Double) -> RGB {
+        RGB(red: red, green: green, blue: blue, alpha: alpha, space: space)
+    }
+    var sourceDescription: String {
+        "\(space.rawValue) \(hex) alpha \(String(format: "%.4f", alpha))"
+    }
+    var serializedCSS: String {
+        if space == .displayP3 {
+            let alphaSuffix = alpha < 1 ? " / \(String(format: "%.4f", alpha))" : ""
+            return "color(display-p3 \(String(format: "%.6f", red)) \(String(format: "%.6f", green)) \(String(format: "%.6f", blue))\(alphaSuffix))"
+        }
+        if alpha < 1 {
+            return hex + String(format: "%02X", Int((alpha * 255).rounded()))
+        }
+        return hex
+    }
+}
+
 /// Stores one discovered color and where it came from.
 struct ColorMatch: Hashable {
     var color: RGB
     var source: String
     var line: Int
     var column: Int
+    var rangeLocation: Int? = nil
+    var rangeLength: Int? = nil
+    var tokenName: String? = nil
 
     /// Provides a stable key for deduplicating colors by rendered value.
-    var key: String { color.hex }
+    var key: String {
+        let colorKey = "\(color.space.rawValue)|\(color.hex)|\(String(format: "%.5f", color.alpha))"
+        return tokenName.map { "\(normalizedTokenName($0))|\(colorKey)" } ?? colorKey
+    }
 
     /// Provides a stable location key that keeps structured JSON colors after text matches.
     var sortLocation: (line: Int, column: Int) {
@@ -305,13 +589,21 @@ enum ContrastGate: String {
 
 /// Names the available top-level CLI commands.
 enum Command {
-    case audit(filePath: String, gate: ContrastGate, json: Bool)
+    case audit(filePath: String, gate: ContrastGate, method: AccessibilityMethod, json: Bool)
     case extract(filePath: String, json: Bool)
     case scan(path: String, json: Bool)
     case compile(filePath: String, format: String, outputPath: String)
-    case check(filePath: String, gate: ContrastGate, sarif: Bool, json: Bool)
+    case check(
+        filePath: String,
+        manifestPath: String?,
+        level: ConformanceLevel,
+        method: AccessibilityMethod,
+        allPairs: Bool,
+        sarif: Bool,
+        json: Bool
+    )
     case diff(firstPath: String, secondPath: String, json: Bool)
-    case fix(filePath: String, outputPath: String?, json: Bool)
+    case fix(filePath: String, manifestPath: String?, level: ConformanceLevel, outputPath: String?, json: Bool)
     case watch(path: String, format: String, outputPath: String)
     case version
     case help
@@ -325,6 +617,8 @@ enum CLIError: LocalizedError {
     case unknownOption(String)
     case missingOptionValue(String)
     case invalidGate(String)
+    case invalidLevel(String)
+    case invalidMethod(String)
     case invalidFormat(String)
 
     /// Returns the user-facing error message.
@@ -342,6 +636,10 @@ enum CLIError: LocalizedError {
             return "Missing value for \(option)."
         case .invalidGate(let value):
             return "Invalid gate '\(value)'. Use large, aa, or aaa."
+        case .invalidLevel(let value):
+            return "Invalid level '\(value)'. Use aa or aaa."
+        case .invalidMethod(let value):
+            return "Invalid method '\(value)'. Use wcag22, apca, or both."
         case .invalidFormat(let value):
             return "Invalid format '\(value)'. Use css or json."
         }
@@ -355,25 +653,26 @@ func printUsage(to stream: UnsafeMutablePointer<FILE> = stdout) {
         PaletteWright CLI
 
         Usage:
-          swift Tools/palettewright-cli.swift audit <file> [--gate aa|aaa|large] [--json]
+          swift Tools/palettewright-cli.swift audit <file> [--gate aa|aaa|large] [--method wcag22|apca|both] [--json]
           swift Tools/palettewright-cli.swift extract <file> [--json]
           swift Tools/palettewright-cli.swift scan <folder> [--json]
           swift Tools/palettewright-cli.swift compile <file> --format css|json --output <file>
-          swift Tools/palettewright-cli.swift check <file> [--gate aa|aaa|large] [--json|--sarif]
+          swift Tools/palettewright-cli.swift check <file> --manifest <pairs.json> [--level aa|aaa] [--method wcag22|apca|both] [--json|--sarif]
+          swift Tools/palettewright-cli.swift check <file> --all-pairs [--level aa|aaa] [--json|--sarif]
           swift Tools/palettewright-cli.swift diff <before> <after> [--json]
-          swift Tools/palettewright-cli.swift fix <file> [--output <file>] [--json]
+          swift Tools/palettewright-cli.swift fix <file> --manifest <pairs.json> [--level aa|aaa] [--output <file>] [--json]
           swift Tools/palettewright-cli.swift watch <file-or-folder> --format css|json --output <file>
           swift Tools/palettewright-cli.swift version
           swift Tools/palettewright-cli.swift help
 
         Commands:
-          audit    Extract colors and report WCAG contrast coverage.
+          audit    Explore all extracted pairs with WCAG 2.2 and/or APCA.
           extract  List unique colors discovered in a CSS/JSON/text file.
           scan     Recursively inventory source colors and their locations.
           compile  Produce deterministic CSS or JSON token output.
-          check    Gate color contrast with JSON or SARIF output for CI.
+          check    Gate declared semantic relationships with text, JSON, or SARIF output.
           diff     Compare two token sources by normalized color value.
-          fix      Generate a deterministic high-contrast repair palette.
+          fix      Generate manifest-aware repair candidates and relationship impact.
           watch    Recompile whenever a connected file or folder changes.
           version  Print the CLI version.
 
@@ -384,7 +683,7 @@ func printUsage(to stream: UnsafeMutablePointer<FILE> = stdout) {
           JSON hex/RGB/component color objects
 
         Exit codes:
-          0  Command succeeded. For audit/check, every pair met the selected gate.
+          0  Command succeeded. For check, every calculated WCAG relationship passed.
           1  Runtime failure or audit/check gate failure.
           2  Invalid arguments.
 
@@ -429,6 +728,7 @@ func parseCommand(_ arguments: [String]) throws -> Command {
 func parseAuditCommand(_ arguments: [String]) throws -> Command {
     var filePath: String?
     var gate = ContrastGate.aa
+    var method = AccessibilityMethod.wcag22
     var json = false
     var index = 0
 
@@ -447,6 +747,16 @@ func parseAuditCommand(_ arguments: [String]) throws -> Command {
             }
             gate = parsedGate
             index = nextIndex
+        case "--method":
+            let nextIndex = index + 1
+            guard nextIndex < arguments.count else {
+                throw CLIError.missingOptionValue(argument)
+            }
+            guard let parsedMethod = AccessibilityMethod(rawValue: arguments[nextIndex].lowercased()) else {
+                throw CLIError.invalidMethod(arguments[nextIndex])
+            }
+            method = parsedMethod
+            index = nextIndex
         default:
             if argument.hasPrefix("-") {
                 throw CLIError.unknownOption(argument)
@@ -461,7 +771,7 @@ func parseAuditCommand(_ arguments: [String]) throws -> Command {
         throw CLIError.missingFile("audit")
     }
 
-    return .audit(filePath: filePath, gate: gate, json: json)
+    return .audit(filePath: filePath, gate: gate, method: method, json: json)
 }
 
 /// Parses options for the extract command.
@@ -529,27 +839,50 @@ func parseCompileCommand(_ arguments: [String], watch: Bool) throws -> Command {
 
 func parseCheckCommand(_ arguments: [String]) throws -> Command {
     var filePath: String?
-    var gate = ContrastGate.aa
+    var manifestPath: String?
+    var level = ConformanceLevel.aa
+    var method = AccessibilityMethod.both
+    var allPairs = false
     var sarif = false
     var json = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
-        if argument == "--gate" {
+        if argument == "--manifest" {
             guard index + 1 < arguments.count else { throw CLIError.missingOptionValue(argument) }
-            guard let value = ContrastGate(rawValue: arguments[index + 1].lowercased()) else {
-                throw CLIError.invalidGate(arguments[index + 1])
-            }
-            gate = value
+            manifestPath = arguments[index + 1]
             index += 1
-        } else if argument == "--sarif" { sarif = true }
+        } else if argument == "--level" {
+            guard index + 1 < arguments.count else { throw CLIError.missingOptionValue(argument) }
+            guard let value = ConformanceLevel(rawValue: arguments[index + 1].lowercased()) else {
+                throw CLIError.invalidLevel(arguments[index + 1])
+            }
+            level = value
+            index += 1
+        } else if argument == "--method" {
+            guard index + 1 < arguments.count else { throw CLIError.missingOptionValue(argument) }
+            guard let value = AccessibilityMethod(rawValue: arguments[index + 1].lowercased()) else {
+                throw CLIError.invalidMethod(arguments[index + 1])
+            }
+            method = value
+            index += 1
+        } else if argument == "--all-pairs" { allPairs = true }
+        else if argument == "--sarif" { sarif = true }
         else if argument == "--json" { json = true }
         else if argument.hasPrefix("-") { throw CLIError.unknownOption(argument) }
         else { filePath = argument }
         index += 1
     }
     guard let filePath else { throw CLIError.missingFile("check") }
-    return .check(filePath: filePath, gate: gate, sarif: sarif, json: json)
+    return .check(
+        filePath: filePath,
+        manifestPath: manifestPath,
+        level: level,
+        method: method,
+        allPairs: allPairs,
+        sarif: sarif,
+        json: json
+    )
 }
 
 func parseDiffCommand(_ arguments: [String]) throws -> Command {
@@ -564,14 +897,24 @@ func parseDiffCommand(_ arguments: [String]) throws -> Command {
 
 func parseFixCommand(_ arguments: [String]) throws -> Command {
     var filePath: String?
+    var manifestPath: String?
+    var level = ConformanceLevel.aa
     var output: String?
     var json = false
     var index = 0
     while index < arguments.count {
         let argument = arguments[index]
-        if argument == "--output" {
+        if argument == "--output" || argument == "--manifest" || argument == "--level" {
             guard index + 1 < arguments.count else { throw CLIError.missingOptionValue(argument) }
-            output = arguments[index + 1]
+            if argument == "--output" {
+                output = arguments[index + 1]
+            } else if argument == "--manifest" {
+                manifestPath = arguments[index + 1]
+            } else if let parsed = ConformanceLevel(rawValue: arguments[index + 1].lowercased()) {
+                level = parsed
+            } else {
+                throw CLIError.invalidLevel(arguments[index + 1])
+            }
             index += 1
         } else if argument == "--json" { json = true }
         else if argument.hasPrefix("-") { throw CLIError.unknownOption(argument) }
@@ -579,7 +922,7 @@ func parseFixCommand(_ arguments: [String]) throws -> Command {
         index += 1
     }
     guard let filePath else { throw CLIError.missingFile("fix") }
-    return .fix(filePath: filePath, outputPath: output, json: json)
+    return .fix(filePath: filePath, manifestPath: manifestPath, level: level, outputPath: output, json: json)
 }
 
 /// Reads a UTF-8 text file for color extraction.
@@ -604,6 +947,12 @@ func extractColorMatches(from text: String) -> [ColorMatch] {
     matches += okLCHColorMatches(in: text)
     matches += displayP3ColorMatches(in: text)
     matches += structuredJSONColorMatches(in: text)
+
+    matches = matches.map { match in
+        var annotated = match
+        annotated.tokenName = inferredTokenName(atLine: match.line, column: match.column, in: text)
+        return annotated
+    }
 
     var seen: Set<String> = []
     return matches
@@ -632,12 +981,15 @@ func hexColorMatches(in text: String) -> [ColorMatch] {
         pattern: "#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{4}|[0-9a-fA-F]{3})\\b",
         in: text
     ).compactMap { raw, range in
-        let hex = normalizeHex(raw)
-        guard hex.count == 7 else {
-            return nil
-        }
         let location = lineColumn(for: range.location, in: text)
-        return ColorMatch(color: RGB(hex: hex), source: raw, line: location.line, column: location.column)
+        return ColorMatch(
+            color: RGB(hex: raw),
+            source: raw,
+            line: location.line,
+            column: location.column,
+            rangeLocation: range.location,
+            rangeLength: range.length
+        )
     }
 }
 
@@ -662,10 +1014,17 @@ func rgbColorMatches(in text: String) -> [ColorMatch] {
 
         let location = lineColumn(for: range.location, in: text)
         return ColorMatch(
-            color: RGB(red: red, green: green, blue: blue),
+            color: RGB(
+                red: red,
+                green: green,
+                blue: blue,
+                alpha: components.count > 3 ? (unitIntervalValue(from: components[3]) ?? 1) : 1
+            ),
             source: raw,
             line: location.line,
-            column: location.column
+            column: location.column,
+            rangeLocation: range.location,
+            rangeLength: range.length
         )
     }
 }
@@ -691,10 +1050,13 @@ func hslColorMatches(in text: String) -> [ColorMatch] {
 
         let location = lineColumn(for: range.location, in: text)
         return ColorMatch(
-            color: rgbFromHSL(hue: hue, saturation: saturation, lightness: lightness),
+            color: rgbFromHSL(hue: hue, saturation: saturation, lightness: lightness)
+                .withAlpha(components.count > 3 ? (unitIntervalValue(from: components[3]) ?? 1) : 1),
             source: raw,
             line: location.line,
-            column: location.column
+            column: location.column,
+            rangeLocation: range.location,
+            rangeLength: range.length
         )
     }
 }
@@ -720,10 +1082,13 @@ func hwbColorMatches(in text: String) -> [ColorMatch] {
 
         let location = lineColumn(for: range.location, in: text)
         return ColorMatch(
-            color: rgbFromHWB(hue: hue, whiteness: whiteness, blackness: blackness),
+            color: rgbFromHWB(hue: hue, whiteness: whiteness, blackness: blackness)
+                .withAlpha(components.count > 3 ? (unitIntervalValue(from: components[3]) ?? 1) : 1),
             source: raw,
             line: location.line,
-            column: location.column
+            column: location.column,
+            rangeLocation: range.location,
+            rangeLength: range.length
         )
     }
 }
@@ -749,10 +1114,13 @@ func cieLabColorMatches(in text: String) -> [ColorMatch] {
 
         let location = lineColumn(for: range.location, in: text)
         return ColorMatch(
-            color: RGB.fromCIELab(CIELab(lightness: lightness, a: a, b: b)),
+            color: RGB.fromCIELab(CIELab(lightness: lightness, a: a, b: b))
+                .withAlpha(components.count > 3 ? (unitIntervalValue(from: components[3]) ?? 1) : 1),
             source: raw,
             line: location.line,
-            column: location.column
+            column: location.column,
+            rangeLocation: range.location,
+            rangeLength: range.length
         )
     }
 }
@@ -778,10 +1146,13 @@ func cieLCHColorMatches(in text: String) -> [ColorMatch] {
 
         let location = lineColumn(for: range.location, in: text)
         return ColorMatch(
-            color: RGB.fromCIELCH(CIELCH(lightness: lightness, chroma: chroma, hueDegrees: hue)),
+            color: RGB.fromCIELCH(CIELCH(lightness: lightness, chroma: chroma, hueDegrees: hue))
+                .withAlpha(components.count > 3 ? (unitIntervalValue(from: components[3]) ?? 1) : 1),
             source: raw,
             line: location.line,
-            column: location.column
+            column: location.column,
+            rangeLocation: range.location,
+            rangeLength: range.length
         )
     }
 }
@@ -807,10 +1178,13 @@ func okLabColorMatches(in text: String) -> [ColorMatch] {
 
         let location = lineColumn(for: range.location, in: text)
         return ColorMatch(
-            color: RGB.fromOKLab(OKLab(lightness: lightness, a: a, b: b)),
+            color: RGB.fromOKLab(OKLab(lightness: lightness, a: a, b: b))
+                .withAlpha(components.count > 3 ? (unitIntervalValue(from: components[3]) ?? 1) : 1),
             source: raw,
             line: location.line,
-            column: location.column
+            column: location.column,
+            rangeLocation: range.location,
+            rangeLength: range.length
         )
     }
 }
@@ -836,10 +1210,13 @@ func okLCHColorMatches(in text: String) -> [ColorMatch] {
 
         let location = lineColumn(for: range.location, in: text)
         return ColorMatch(
-            color: RGB.fromOKLCH(OKLCH(lightness: lightness, chroma: chroma, hueDegrees: hue)),
+            color: RGB.fromOKLCH(OKLCH(lightness: lightness, chroma: chroma, hueDegrees: hue))
+                .withAlpha(components.count > 3 ? (unitIntervalValue(from: components[3]) ?? 1) : 1),
             source: raw,
             line: location.line,
-            column: location.column
+            column: location.column,
+            rangeLocation: range.location,
+            rangeLength: range.length
         )
     }
 }
@@ -865,10 +1242,18 @@ func displayP3ColorMatches(in text: String) -> [ColorMatch] {
 
         let location = lineColumn(for: range.location, in: text)
         return ColorMatch(
-            color: RGB(red: red, green: green, blue: blue),
+            color: RGB(
+                red: red,
+                green: green,
+                blue: blue,
+                alpha: components.count > 3 ? (unitIntervalValue(from: components[3]) ?? 1) : 1,
+                space: .displayP3
+            ),
             source: raw,
             line: location.line,
-            column: location.column
+            column: location.column,
+            rangeLocation: range.location,
+            rangeLength: range.length
         )
     }
 }
@@ -938,7 +1323,18 @@ func jsonColor(from dictionary: [String: Any]) -> JSONColorHit? {
     if let red = numericValue(dictionary["r"] ?? dictionary["red"]),
        let green = numericValue(dictionary["g"] ?? dictionary["green"]),
        let blue = numericValue(dictionary["b"] ?? dictionary["blue"]) {
-        return JSONColorHit(color: rgbColor(from: [red, green, blue]), source: "JSON RGB components")
+        let values = [red, green, blue].map { abs($0) > 1 ? $0 / 255 : $0 }
+        let spaceName = stringValue(dictionary["colorSpace"] ?? dictionary["space"] ?? dictionary["model"])?.lowercased() ?? "srgb"
+        return JSONColorHit(
+            color: RGB(
+                red: values[0],
+                green: values[1],
+                blue: values[2],
+                alpha: numericValue(dictionary["alpha"] ?? dictionary["opacity"]) ?? 1,
+                space: spaceName.contains("p3") ? .displayP3 : .sRGB
+            ),
+            source: "JSON RGB components"
+        )
     }
 
     guard let components = dictionary["components"] as? [Any] else {
@@ -953,17 +1349,21 @@ func jsonColor(from dictionary: [String: Any]) -> JSONColorHit? {
     let space = stringValue(dictionary["colorSpace"] ?? dictionary["space"] ?? dictionary["model"])?
         .lowercased()
         .replacingOccurrences(of: "_", with: "-") ?? "srgb"
+    let alpha = numericValue(dictionary["alpha"] ?? dictionary["opacity"])
+        ?? (numbers.count > 3 ? numbers[3] : 1)
 
     if space.contains("oklch") {
         return JSONColorHit(
-            color: RGB.fromOKLCH(OKLCH(lightness: numbers[0], chroma: numbers[1], hueDegrees: numbers[2])),
+            color: RGB.fromOKLCH(OKLCH(lightness: numbers[0], chroma: numbers[1], hueDegrees: numbers[2]))
+                .withAlpha(alpha),
             source: "JSON OKLCH components"
         )
     }
 
     if space.contains("oklab") {
         return JSONColorHit(
-            color: RGB.fromOKLab(OKLab(lightness: numbers[0], a: numbers[1], b: numbers[2])),
+            color: RGB.fromOKLab(OKLab(lightness: numbers[0], a: numbers[1], b: numbers[2]))
+                .withAlpha(alpha),
             source: "JSON OKLab components"
         )
     }
@@ -976,7 +1376,7 @@ func jsonColor(from dictionary: [String: Any]) -> JSONColorHit? {
                     chroma: numbers[1],
                     hueDegrees: numbers[2]
                 )
-            ),
+            ).withAlpha(alpha),
             source: "JSON LCH components"
         )
     }
@@ -989,12 +1389,22 @@ func jsonColor(from dictionary: [String: Any]) -> JSONColorHit? {
                     a: numbers[1],
                     b: numbers[2]
                 )
-            ),
+            ).withAlpha(alpha),
             source: "JSON Lab components"
         )
     }
 
-    return JSONColorHit(color: rgbColor(from: Array(numbers.prefix(3))), source: "JSON RGB components")
+    let values = Array(numbers.prefix(3)).map { abs($0) > 1 ? $0 / 255 : $0 }
+    return JSONColorHit(
+        color: RGB(
+            red: values[0],
+            green: values[1],
+            blue: values[2],
+            alpha: alpha,
+            space: space.contains("p3") ? .displayP3 : .sRGB
+        ),
+        source: "JSON RGB components"
+    )
 }
 
 /// Converts RGB-like components into a color.
@@ -1234,6 +1644,41 @@ func rgbFromHWB(hue: Double, whiteness: Double, blackness: Double) -> RGB {
     )
 }
 
+func normalizedTokenName(_ value: String) -> String {
+    value
+        .replacingOccurrences(
+            of: #"([a-z0-9])([A-Z])"#,
+            with: "$1-$2",
+            options: .regularExpression
+        )
+        .lowercased()
+        .replacingOccurrences(of: "--", with: "")
+        .replacingOccurrences(of: "_", with: "-")
+        .replacingOccurrences(of: ".", with: "-")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func inferredTokenName(atLine line: Int, column: Int, in text: String) -> String? {
+    guard line > 0 else { return nil }
+    let lines = text.components(separatedBy: .newlines)
+    guard lines.indices.contains(line - 1) else { return nil }
+    let currentLine = lines[line - 1]
+    let prefix = String(currentLine.prefix(max(column - 1, 0)))
+    let patterns = [
+        #"(--[A-Za-z0-9_-]+)\s*:\s*$"#,
+        #"[\"']([^\"']+)[\"']\s*:\s*[\"']?\s*$"#,
+        #"(?:let|var|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)[^=]*=\s*[\"']?\s*$"#,
+        #"([A-Za-z_$][A-Za-z0-9_$.-]*)\s*:\s*[\"']?\s*$"#,
+        #"([A-Za-z_:][A-Za-z0-9_:.-]*)\s*=\s*[\"']?\s*$"#
+    ]
+    for pattern in patterns {
+        if let name = firstCapture(pattern: pattern, in: prefix) {
+            return name
+        }
+    }
+    return nil
+}
+
 /// Returns the one-based line and column for a UTF-16 text offset.
 func lineColumn(for location: Int, in text: String) -> (line: Int, column: Int) {
     var line = 1
@@ -1297,6 +1742,195 @@ func regexMatches(
     }
 }
 
+struct SemanticPairManifest: Codable {
+    var foreground: String
+    var background: String
+    var usage: AccessibilityUsage
+    var modes: [String]?
+    var states: [String]?
+    var unsupportedContext: String?
+}
+
+private struct SemanticManifestDocument: Codable {
+    var pairs: [SemanticPairManifest]
+}
+
+struct SemanticFinding {
+    var pair: SemanticPairManifest
+    var mode: String
+    var state: String
+    var foreground: ColorMatch?
+    var background: ColorMatch?
+    var evaluation: CLIColorEvaluation
+
+    var id: String {
+        "\(pair.foreground)-on-\(pair.background)-\(mode)-\(state)-\(pair.usage.rawValue)"
+    }
+}
+
+func readSemanticManifest(at path: String) throws -> [SemanticPairManifest] {
+    let url = URL(fileURLWithPath: path)
+    guard let data = try? Data(contentsOf: url) else {
+        throw CLIError.unreadableFile(url.path)
+    }
+    let decoder = JSONDecoder()
+    if let document = try? decoder.decode(SemanticManifestDocument.self, from: data) {
+        return document.pairs
+    }
+    if let pairs = try? decoder.decode([SemanticPairManifest].self, from: data) {
+        return pairs
+    }
+    if let pair = try? decoder.decode(SemanticPairManifest.self, from: data) {
+        return [pair]
+    }
+    throw CLIError.unreadableFile("\(url.path) (invalid semantic pair manifest)")
+}
+
+func resolveToken(
+    _ reference: String,
+    mode: String,
+    matches: [ColorMatch]
+) -> ColorMatch? {
+    let referenceName = normalizedTokenName(reference)
+    let modeName = normalizedTokenName(mode)
+    let candidates = matches.filter { $0.tokenName != nil }
+    let modeNames: [String]
+    switch modeName {
+    case "increased-contrast": modeNames = ["increased-contrast", "high-contrast"]
+    case "high-contrast": modeNames = ["high-contrast", "increased-contrast"]
+    default: modeNames = [modeName]
+    }
+    let names = modeNames.flatMap { modeName in
+        ["\(modeName)-\(referenceName)", "\(referenceName)-\(modeName)"]
+    } + [referenceName]
+
+    for name in names {
+        let exact = candidates.filter { normalizedTokenName($0.tokenName ?? "") == name }
+        if exact.count == 1 { return exact[0] }
+        if exact.count > 1 {
+            return exact.sorted { ($0.line, $0.column) < ($1.line, $1.column) }.first
+        }
+    }
+
+    let suffix = candidates.filter {
+        let token = normalizedTokenName($0.tokenName ?? "")
+        return token.hasSuffix("-\(referenceName)") || referenceName.hasSuffix("-\(token)")
+    }
+    return suffix.count == 1 ? suffix[0] : nil
+}
+
+func semanticFindings(
+    matches: [ColorMatch],
+    manifest: [SemanticPairManifest],
+    level: ConformanceLevel
+) -> [SemanticFinding] {
+    manifest.flatMap { pair -> [SemanticFinding] in
+        let modes = pair.modes?.isEmpty == false ? pair.modes! : ["default"]
+        let states = pair.states?.isEmpty == false ? pair.states! : ["default"]
+        return modes.flatMap { mode in
+            states.map { state in
+                let foreground = resolveToken(pair.foreground, mode: mode, matches: matches)
+                let background = resolveToken(pair.background, mode: mode, matches: matches)
+                let unresolved = foreground == nil || background == nil
+                    ? "A declared token or variable could not be resolved."
+                    : nil
+                let evaluation: CLIColorEvaluation
+                if let foreground, let background {
+                    evaluation = CLIColorEngine.evaluate(
+                        foreground: foreground.color,
+                        background: background.color,
+                        usage: pair.usage,
+                        level: level,
+                        unsupportedReason: pair.unsupportedContext ?? unresolved
+                    )
+                } else {
+                    evaluation = CLIColorEngine.evaluate(
+                        foreground: RGB(hex: "#000000"),
+                        background: RGB(hex: "#FFFFFF"),
+                        usage: pair.usage,
+                        level: level,
+                        unsupportedReason: pair.unsupportedContext ?? unresolved
+                    )
+                }
+                return SemanticFinding(
+                    pair: pair,
+                    mode: mode,
+                    state: state,
+                    foreground: foreground,
+                    background: background,
+                    evaluation: evaluation
+                )
+            }
+        }
+    }
+}
+
+func allPairFindings(
+    matches: [ColorMatch],
+    level: ConformanceLevel,
+    usage: AccessibilityUsage = .normalText
+) -> [SemanticFinding] {
+    matches.flatMap { foreground in
+        matches.filter { $0.key != foreground.key }.map { background in
+            let pair = SemanticPairManifest(
+                foreground: foreground.tokenName ?? foreground.color.hex,
+                background: background.tokenName ?? background.color.hex,
+                usage: usage,
+                modes: ["exploratory"],
+                states: ["default"],
+                unsupportedContext: nil
+            )
+            return SemanticFinding(
+                pair: pair,
+                mode: "exploratory",
+                state: "default",
+                foreground: foreground,
+                background: background,
+                evaluation: CLIColorEngine.evaluate(
+                    foreground: foreground.color,
+                    background: background.color,
+                    usage: usage,
+                    level: level
+                )
+            )
+        }
+    }
+}
+
+func findingDictionary(_ finding: SemanticFinding) -> [String: Any] {
+    let evaluation = finding.evaluation
+    var value: [String: Any] = [
+        "id": finding.id,
+        "foregroundToken": finding.pair.foreground,
+        "backgroundToken": finding.pair.background,
+        "usage": finding.pair.usage.rawValue,
+        "mode": finding.mode,
+        "state": finding.state,
+        "decision": evaluation.decision.rawValue,
+        "sourceColorSpace": [finding.foreground?.color.space.rawValue, finding.background?.color.space.rawValue]
+            .compactMap { $0 }.joined(separator: " / "),
+        "sourceForeground": finding.foreground?.color.sourceDescription ?? NSNull(),
+        "sourceBackground": finding.background?.color.sourceDescription ?? NSNull(),
+        "effectiveForeground": evaluation.effectiveForeground?.sourceDescription ?? NSNull(),
+        "effectiveBackground": evaluation.effectiveBackground?.sourceDescription ?? NSNull(),
+        "wcagRawResult": evaluation.wcagRatio ?? NSNull(),
+        "wcagWideGamutRawResult": evaluation.wideGamutRatio ?? NSNull(),
+        "threshold": evaluation.threshold ?? NSNull(),
+        "apcaSignedLc": evaluation.apcaLc ?? NSNull(),
+        "apcaSRGBFallbackSignedLc": evaluation.apcaFallbackLc ?? NSNull(),
+        "method": CLIColorEngine.wcagVersion,
+        "decisionBasis": CLIColorEngine.wcagVersion,
+        "apcaMethod": CLIColorEngine.apcaVersion,
+        "reviewReason": evaluation.reviewReason ?? NSNull(),
+        "foregroundLocation": finding.foreground?.locationDictionary ?? [:],
+        "backgroundLocation": finding.background?.locationDictionary ?? [:]
+    ]
+    if let lc = evaluation.apcaLc {
+        value["apcaTypographyGuidance"] = CLIColorEngine.typographyGuidance(lc: lc, usage: finding.pair.usage)
+    }
+    return value
+}
+
 /// Builds all ordered foreground/background contrast pairs.
 func contrastPairs(for colors: [RGB]) -> [(foreground: RGB, background: RGB, ratio: Double)] {
     colors.flatMap { foreground in
@@ -1335,65 +1969,75 @@ func runExtract(filePath: String, json: Bool) throws -> Int32 {
 }
 
 /// Runs the audit command and returns the process exit code.
-func runAudit(filePath: String, gate: ContrastGate, json: Bool) throws -> Int32 {
+func runAudit(
+    filePath: String,
+    gate: ContrastGate,
+    method: AccessibilityMethod,
+    json: Bool
+) throws -> Int32 {
     let (fileURL, text) = try readTextFile(at: filePath)
     let matches = extractColorMatches(from: text)
-    let colors = matches.map(\.color)
 
-    guard colors.count >= 2 else {
+    guard matches.count >= 2 else {
         if json {
             printJSON([
                 "file": fileURL.path,
-                "colors": colors.count,
+                "colors": matches.count,
                 "error": "Need at least 2 colors to audit contrast."
             ])
         } else {
-            print("Found \(colors.count) color. Need at least 2 colors to audit contrast.")
+            print("Found \(matches.count) color. Need at least 2 colors to audit contrast.")
         }
         return 1
     }
 
-    let pairs = contrastPairs(for: colors)
-    let passing = pairs.filter { $0.ratio >= gate.threshold }
-    let aa = pairs.filter { $0.ratio >= ContrastGate.aa.threshold }.count
-    let large = pairs.filter { $0.ratio >= ContrastGate.large.threshold }.count
-    let aaa = pairs.filter { $0.ratio >= ContrastGate.aaa.threshold }.count
-    let weakest = pairs.min { $0.ratio < $1.ratio }
-    let strongest = pairs.max { $0.ratio < $1.ratio }
-    let didPass = passing.count == pairs.count
+    let usage: AccessibilityUsage = gate == .large ? .largeText : .normalText
+    let level: ConformanceLevel = gate == .aaa ? .aaa : .aa
+    let findings = allPairFindings(matches: matches, level: level, usage: usage)
+    let passing = findings.filter { $0.evaluation.decision == .pass }.count
+    let failing = findings.filter { $0.evaluation.decision == .fail }.count
+    let review = findings.filter { $0.evaluation.decision == .needsReview }.count
+    let calculated = findings.compactMap { finding -> (SemanticFinding, Double)? in
+        finding.evaluation.wcagRatio.map { (finding, $0) }
+    }
+    let weakest = calculated.min { $0.1 < $1.1 }
+    let strongest = calculated.max { $0.1 < $1.1 }
+    let didPass = (method == .apca || failing == 0) && review == 0
 
     if json {
         printJSON([
+            "toolVersion": cliVersion,
             "file": fileURL.path,
+            "exploratory": true,
+            "method": method.label,
+            "wcagMethodVersion": CLIColorEngine.wcagVersion,
+            "apcaMethodVersion": CLIColorEngine.apcaVersion,
+            "apcaStatus": "supplemental / experimental; no WCAG 3 conformance claim",
             "gate": gate.rawValue,
             "gateThreshold": gate.threshold,
             "passed": didPass,
-            "colors": colors.map(\.hex),
-            "pairCount": pairs.count,
-            "passingPairCount": passing.count,
-            "aaNormalPairCount": aa,
-            "aaLargePairCount": large,
-            "aaaPairCount": aaa,
-            "weakest": pairDictionary(weakest),
-            "strongest": pairDictionary(strongest)
+            "wcagGatePassed": failing == 0 && review == 0,
+            "colors": matches.map { $0.color.sourceDescription },
+            "pairCount": findings.count,
+            "passingPairCount": passing,
+            "failingPairCount": failing,
+            "needsReviewPairCount": review,
+            "weakest": weakest.map { findingDictionary($0.0) } ?? [:],
+            "strongest": strongest.map { findingDictionary($0.0) } ?? [:],
+            "relationships": findings.map(findingDictionary)
         ])
     } else {
         print("PaletteWright audit: \(fileURL.lastPathComponent)")
+        print("Exploratory all-pairs mode (not the semantic conformance gate)")
+        print("Method: \(method.label)")
+        print("WCAG: \(CLIColorEngine.wcagVersion)")
+        if method != .wcag22 { print("APCA: \(CLIColorEngine.apcaVersion) — supplemental / experimental") }
         print("Gate: \(gate.label) \(String(format: "%.1f", gate.threshold)):1")
-        print("Colors: \(colors.count)")
-        print("Pairs: \(pairs.count)")
-        print(String(format: "Passing gate: %d/%d", passing.count, pairs.count))
-        print(String(format: "AA normal: %d/%d", aa, pairs.count))
-        print(String(format: "AA large / non-text: %d/%d", large, pairs.count))
-        print(String(format: "AAA: %d/%d", aaa, pairs.count))
-
-        if let weakest {
-            print(String(format: "Weakest: %@ on %@ %.2f:1", weakest.foreground.hex, weakest.background.hex, weakest.ratio))
-        }
-
-        if let strongest {
-            print(String(format: "Strongest: %@ on %@ %.2f:1", strongest.foreground.hex, strongest.background.hex, strongest.ratio))
-        }
+        print("Colors: \(matches.count)")
+        print("Pairs: \(findings.count)")
+        print("WCAG decisions — Pass: \(passing) · Fail: \(failing) · Needs review: \(review)")
+        if let weakest { print(String(format: "Weakest: %@ %.4f:1", weakest.0.id, weakest.1)) }
+        if let strongest { print(String(format: "Strongest: %@ %.4f:1", strongest.0.id, strongest.1)) }
     }
 
     return didPass ? 0 : 1
@@ -1494,26 +2138,117 @@ func runCompile(filePath: String, format: String, outputPath: String) throws -> 
     return 0
 }
 
-func runCheck(filePath: String, gate: ContrastGate, sarif: Bool, json: Bool) throws -> Int32 {
-    guard sarif else { return try runAudit(filePath: filePath, gate: gate, json: json) }
+func runCheck(
+    filePath: String,
+    manifestPath: String?,
+    level: ConformanceLevel,
+    method: AccessibilityMethod,
+    allPairs: Bool,
+    sarif: Bool,
+    json: Bool
+) throws -> Int32 {
     let (url, text) = try readTextFile(at: filePath)
     let matches = extractColorMatches(from: text)
-    guard let background = matches.first else { printJSON(["version": "2.1.0", "runs": []]); return 1 }
-    let failures = matches.dropFirst().filter { $0.color.contrast(with: background.color) < gate.threshold }
-    let results: [[String: Any]] = failures.map { match in
-        [
-            "ruleId": "PW001",
-            "level": "error",
-            "message": ["text": "\(match.color.hex) has insufficient contrast against \(background.color.hex)."],
-            "locations": [["physicalLocation": ["artifactLocation": ["uri": url.path], "region": ["startLine": max(match.line, 1), "startColumn": max(match.column, 1)]]]]
-        ]
+    let findings: [SemanticFinding]
+    if allPairs {
+        findings = allPairFindings(matches: matches, level: level)
+    } else if let manifestPath {
+        findings = semanticFindings(
+            matches: matches,
+            manifest: try readSemanticManifest(at: manifestPath),
+            level: level
+        )
+    } else {
+        let pair = SemanticPairManifest(
+            foreground: "unresolved",
+            background: "unresolved",
+            usage: .normalText,
+            modes: ["default"],
+            states: ["default"],
+            unsupportedContext: "No semantic pair manifest was supplied. Use --manifest or explicit --all-pairs exploration."
+        )
+        findings = semanticFindings(matches: matches, manifest: [pair], level: level)
     }
-    printJSON([
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [["tool": ["driver": ["name": "PaletteWright", "version": cliVersion, "rules": [["id": "PW001", "shortDescription": ["text": "Insufficient color contrast"]]]]], "results": results]]
-    ])
-    return failures.isEmpty ? 0 : 1
+    let failed = findings.filter { $0.evaluation.decision == .fail }
+    let review = findings.filter { $0.evaluation.decision == .needsReview }
+    let passed = findings.filter { $0.evaluation.decision == .pass }
+    let normativeFailures = method == .apca ? 0 : failed.count
+    let completedWithoutReview = normativeFailures == 0 && review.isEmpty
+
+    if sarif {
+        let results: [[String: Any]] = (method == .apca ? review : failed + review).map { finding in
+            let needsReview = finding.evaluation.decision == .needsReview
+            let primary = finding.foreground ?? finding.background
+            let secondary = finding.background
+            let locations = [primary, secondary].compactMap { match -> [String: Any]? in
+                guard let match else { return nil }
+                return [
+                    "physicalLocation": [
+                        "artifactLocation": ["uri": url.path],
+                        "region": ["startLine": max(match.line, 1), "startColumn": max(match.column, 1)]
+                    ]
+                ]
+            }
+            return [
+                "ruleId": needsReview ? "PW002" : "PW001",
+                "level": needsReview ? "warning" : "error",
+                "message": [
+                    "text": needsReview
+                        ? "\(finding.id) needs review: \(finding.evaluation.reviewReason ?? "runtime context is unknown")"
+                        : "\(finding.id) fails \(level.rawValue.uppercased()) at raw ratio \(finding.evaluation.wcagRatio ?? 0)."
+                ],
+                "locations": locations,
+                "properties": findingDictionary(finding)
+            ]
+        }
+        printJSON([
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [[
+                "tool": ["driver": [
+                    "name": "PaletteWright",
+                    "version": cliVersion,
+                    "informationUri": "https://palettewright.com",
+                    "rules": [
+                        ["id": "PW001", "shortDescription": ["text": "Declared relationship fails WCAG contrast"]],
+                        ["id": "PW002", "shortDescription": ["text": "Declared relationship needs rendered or human review"]]
+                    ]
+                ]],
+                "results": results
+            ]]
+        ])
+    } else if json {
+        printJSON([
+            "tool": "PaletteWright",
+            "toolVersion": cliVersion,
+            "file": url.path,
+            "manifest": (manifestPath as Any?) ?? NSNull(),
+            "exploratoryAllPairs": allPairs,
+            "level": level.rawValue,
+            "method": method.label,
+            "wcagMethodVersion": CLIColorEngine.wcagVersion,
+            "apcaMethodVersion": CLIColorEngine.apcaVersion,
+            "apcaStatus": "supplemental / experimental; no WCAG 3 conformance claim",
+            "passed": completedWithoutReview,
+            "wcagGatePassed": failed.isEmpty && review.isEmpty,
+            "summary": ["pass": passed.count, "fail": failed.count, "needsReview": review.count],
+            "relationships": findings.map(findingDictionary)
+        ])
+    } else {
+        print("PaletteWright semantic check: \(url.lastPathComponent)")
+        print("Method: \(method.label) · Level: \(level.rawValue.uppercased())")
+        print("WCAG: \(CLIColorEngine.wcagVersion)")
+        if method != .wcag22 { print("APCA: \(CLIColorEngine.apcaVersion) — supplemental / experimental") }
+        print("WCAG decisions — Pass: \(passed.count) · Fail: \(failed.count) · Needs review: \(review.count)")
+        for finding in findings {
+            let ratio = finding.evaluation.wcagRatio.map { String(format: "%.4f:1", $0) } ?? "n/a"
+            let lc = finding.evaluation.apcaLc.map { String(format: "%+.2f Lc", $0) } ?? "n/a"
+            print("\(finding.evaluation.decision.rawValue.uppercased())  \(finding.id)  WCAG \(ratio)  APCA \(lc)")
+            if let reason = finding.evaluation.reviewReason { print("  \(reason)") }
+        }
+    }
+
+    return completedWithoutReview ? 0 : 1
 }
 
 func runDiff(firstPath: String, secondPath: String, json: Bool) throws -> Int32 {
@@ -1531,30 +2266,134 @@ func runDiff(firstPath: String, secondPath: String, json: Bool) throws -> Int32 
     return added.isEmpty && removed.isEmpty ? 0 : 1
 }
 
-func runFix(filePath: String, outputPath: String?, json: Bool) throws -> Int32 {
+func accessibleRepairCandidate(_ foreground: RGB, on background: RGB, target: Double) -> RGB {
+    func minimumDeliveryRatio(_ candidate: RGB) -> Double {
+        let evaluation = CLIColorEngine.evaluate(
+            foreground: candidate,
+            background: background,
+            usage: .normalText
+        )
+        return [evaluation.wcagRatio, evaluation.wideGamutRatio].compactMap { $0 }.min() ?? 0
+    }
+
+    if minimumDeliveryRatio(foreground) >= target {
+        return foreground
+    }
+
+    let sRGBForeground = CLIColorEngine.converted(foreground, to: .sRGB)
+    let sRGBBackground = CLIColorEngine.converted(background, to: .sRGB).opaque
+
+    let original = sRGBForeground.okLCH
+    let shouldLighten = CLIColorEngine.relativeLuminance(of: sRGBBackground, in: .sRGB) < 0.5
+    let targetLightness = shouldLighten ? 0.98 : 0.06
+    for step in 1...96 {
+        let amount = Double(step) / 96
+        let sRGBCandidate = RGB.fromOKLCH(
+            OKLCH(
+                lightness: original.lightness + (targetLightness - original.lightness) * amount,
+                chroma: original.chroma * (1 - amount * 0.34),
+                hueDegrees: original.hueDegrees
+            )
+        ).withAlpha(foreground.alpha)
+        let candidate = CLIColorEngine.converted(sRGBCandidate, to: foreground.space)
+        if minimumDeliveryRatio(candidate) >= target {
+            return candidate
+        }
+    }
+    let black = CLIColorEngine.converted(RGB(hex: "#050505").withAlpha(foreground.alpha), to: foreground.space)
+    let white = CLIColorEngine.converted(RGB(hex: "#FFFFFF").withAlpha(foreground.alpha), to: foreground.space)
+    return minimumDeliveryRatio(black) >= minimumDeliveryRatio(white) ? black : white
+}
+
+func runFix(
+    filePath: String,
+    manifestPath: String?,
+    level: ConformanceLevel,
+    outputPath: String?,
+    json: Bool
+) throws -> Int32 {
     let (url, text) = try readTextFile(at: filePath)
     let matches = extractColorMatches(from: text)
-    guard let background = matches.first else { return 1 }
-    let black = RGB(hex: "#000000")
-    let white = RGB(hex: "#FFFFFF")
-    var replacements: [String: String] = [:]
-    for match in matches.dropFirst() where match.color.contrast(with: background.color) < 4.5 {
-        let repair = black.contrast(with: background.color) >= white.contrast(with: background.color) ? black : white
-        replacements[match.source] = repair.hex
+    guard let manifestPath else {
+        if json {
+            printJSON([
+                "file": url.path,
+                "decision": AccessibilityDecision.needsReview.rawValue,
+                "reviewReason": "A semantic pair manifest is required for repair."
+            ])
+        } else {
+            print("PaletteWright fix needs a semantic pair manifest. Pass --manifest <pairs.json>.")
+        }
+        return 1
     }
+    let manifest = try readSemanticManifest(at: manifestPath)
+    let before = semanticFindings(matches: matches, manifest: manifest, level: level)
+    let failing = before.filter { $0.evaluation.decision == .fail }
+    var replacementDescriptions: [String: String] = [:]
+    var replacementsByLocation: [Int: (length: Int, value: String)] = [:]
+    var candidatesByLocation: [Int: RGB] = [:]
+    for finding in failing {
+        guard let foreground = finding.foreground,
+              let background = finding.background,
+              let threshold = finding.evaluation.threshold,
+              let location = foreground.rangeLocation,
+              let length = foreground.rangeLength else { continue }
+        let candidate = accessibleRepairCandidate(foreground.color, on: background.color, target: threshold)
+        let label = "\(foreground.tokenName ?? foreground.source) @ \(foreground.locationDescription)"
+        replacementDescriptions[label] = "\(foreground.source) -> \(candidate.serializedCSS)"
+        replacementsByLocation[location] = (length: length, value: candidate.serializedCSS)
+        candidatesByLocation[location] = candidate
+    }
+
+    let revisedMatches = matches.map { match -> ColorMatch in
+        guard let location = match.rangeLocation,
+              let candidate = candidatesByLocation[location] else { return match }
+        var revised = match
+        revised.color = candidate
+        return revised
+    }
+    let after = semanticFindings(matches: revisedMatches, manifest: manifest, level: level)
+    let afterByID = Dictionary(uniqueKeysWithValues: after.map { ($0.id, $0) })
+    let improved = before.filter {
+        $0.evaluation.decision == .fail && afterByID[$0.id]?.evaluation.decision == .pass
+    }.map(\.id)
+    let broken = before.filter {
+        $0.evaluation.decision == .pass && afterByID[$0.id]?.evaluation.decision == .fail
+    }.map(\.id)
+    let afterFailureCount = after.filter { $0.evaluation.decision == .fail }.count
+
     if let outputPath {
-        var repaired = text
-        for source in replacements.keys.sorted() { repaired = repaired.replacingOccurrences(of: source, with: replacements[source]!) }
+        let repaired = NSMutableString(string: text)
+        for (location, replacement) in replacementsByLocation.sorted(by: { $0.key > $1.key }) {
+            let range = NSRange(location: location, length: replacement.length)
+            guard NSMaxRange(range) <= repaired.length else { continue }
+            repaired.replaceCharacters(in: range, with: replacement.value)
+        }
         let outputURL = URL(fileURLWithPath: outputPath)
         try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try repaired.write(to: outputURL, atomically: true, encoding: .utf8)
+        try (repaired as String).write(to: outputURL, atomically: true, encoding: .utf8)
     }
-    if json { printJSON(["file": url.path, "background": background.color.hex, "replacements": replacements, "output": (outputPath as Any?) ?? NSNull()]) }
+    if json {
+        printJSON([
+            "file": url.path,
+            "manifest": manifestPath,
+            "level": level.rawValue,
+            "method": CLIColorEngine.wcagVersion,
+            "replacements": replacementDescriptions,
+            "relationshipsImproved": improved,
+            "relationshipsBroken": broken,
+            "beforeFailureCount": failing.count,
+            "afterFailureCount": afterFailureCount,
+            "output": (outputPath as Any?) ?? NSNull()
+        ])
+    }
     else {
-        print("PaletteWright fix: \(replacements.count) suggested replacement(s)")
-        for key in replacements.keys.sorted() { print("\(key) -> \(replacements[key]!)") }
+        print("PaletteWright manifest-aware fix: \(replacementDescriptions.count) suggested replacement(s)")
+        for key in replacementDescriptions.keys.sorted() { print("\(key): \(replacementDescriptions[key]!)") }
+        print("Relationships improved: \(improved.count) · broken: \(broken.count)")
+        if !broken.isEmpty { print("Review regressions: \(broken.joined(separator: ", "))") }
     }
-    return 0
+    return broken.isEmpty && afterFailureCount == 0 ? 0 : 1
 }
 
 func runWatch(path: String, format: String, outputPath: String) throws -> Int32 {
@@ -1610,20 +2449,34 @@ do {
     case .version:
         printVersion()
         exit(0)
-    case .audit(let filePath, let gate, let json):
-        exit(try runAudit(filePath: filePath, gate: gate, json: json))
+    case .audit(let filePath, let gate, let method, let json):
+        exit(try runAudit(filePath: filePath, gate: gate, method: method, json: json))
     case .extract(let filePath, let json):
         exit(try runExtract(filePath: filePath, json: json))
     case .scan(let path, let json):
         exit(try runScan(path: path, json: json))
     case .compile(let filePath, let format, let outputPath):
         exit(try runCompile(filePath: filePath, format: format, outputPath: outputPath))
-    case .check(let filePath, let gate, let sarif, let json):
-        exit(try runCheck(filePath: filePath, gate: gate, sarif: sarif, json: json))
+    case .check(let filePath, let manifestPath, let level, let method, let allPairs, let sarif, let json):
+        exit(try runCheck(
+            filePath: filePath,
+            manifestPath: manifestPath,
+            level: level,
+            method: method,
+            allPairs: allPairs,
+            sarif: sarif,
+            json: json
+        ))
     case .diff(let firstPath, let secondPath, let json):
         exit(try runDiff(firstPath: firstPath, secondPath: secondPath, json: json))
-    case .fix(let filePath, let outputPath, let json):
-        exit(try runFix(filePath: filePath, outputPath: outputPath, json: json))
+    case .fix(let filePath, let manifestPath, let level, let outputPath, let json):
+        exit(try runFix(
+            filePath: filePath,
+            manifestPath: manifestPath,
+            level: level,
+            outputPath: outputPath,
+            json: json
+        ))
     case .watch(let path, let format, let outputPath):
         exit(try runWatch(path: path, format: format, outputPath: outputPath))
     }

@@ -25,9 +25,9 @@ The 2.0 workflow commands are:
 ```sh
 swift Tools/palettewright-cli.swift scan Sources --json
 swift Tools/palettewright-cli.swift compile tokens.json --format css --output Generated/colors.css
-swift Tools/palettewright-cli.swift check tokens.css --gate aa --sarif > palettewright.sarif
+swift Tools/palettewright-cli.swift check tokens.css --manifest palettewright-pairs.json --level aa --sarif > palettewright.sarif
 swift Tools/palettewright-cli.swift diff before.css after.css --json
-swift Tools/palettewright-cli.swift fix tokens.css --output Generated/tokens-fixed.css
+swift Tools/palettewright-cli.swift fix tokens.css --manifest palettewright-pairs.json --output Generated/tokens-fixed.css
 swift Tools/palettewright-cli.swift watch Sources --format json --output Generated/colors.json
 ```
 
@@ -45,7 +45,7 @@ Extract unique colors:
 swift Tools/palettewright-cli.swift extract path/to/tokens-or-css-file.css
 ```
 
-Audit all ordered foreground/background color pairs against WCAG AA normal-text contrast:
+Explore all ordered foreground/background color pairs:
 
 ```sh
 swift Tools/palettewright-cli.swift audit path/to/tokens-or-css-file.css
@@ -84,7 +84,35 @@ swift Tools/palettewright-cli.swift audit path/to/tokens-or-css-file.css --json
 - `color(display-p3 ...)`
 - Structured JSON color objects using `hex`, `red` / `green` / `blue`, or `components` with `colorSpace`, `space`, or `model`
 
-Alpha channels are accepted during extraction but ignored for contrast calculations. The CLI audits the rendered RGB color values.
+Alpha channels are retained and composited when every solid layer is known. Unknown underlayers and unsupported rendered context return `needsReview`.
+
+## Semantic Conformance Gate
+
+Use a semantic pair manifest for CI:
+
+```json
+{
+  "pairs": [
+    {
+      "foreground": "button.primary.label",
+      "background": "button.primary.background",
+      "usage": "normalText",
+      "modes": ["light", "dark", "increasedContrast"],
+      "states": ["default", "hover", "pressed", "focus"]
+    }
+  ]
+}
+```
+
+```sh
+swift Tools/palettewright-cli.swift check tokens.css --manifest palettewright-pairs.json --method both
+swift Tools/palettewright-cli.swift check tokens.css --manifest palettewright-pairs.json --sarif
+swift Tools/palettewright-cli.swift fix tokens.css --manifest palettewright-pairs.json --output tokens.repaired.css
+```
+
+Usage values are `normalText`, `largeText`, `nonTextUI`, `graphic`, and `decorative`. AA/AAA thresholds are derived from usage. WCAG 2.2 remains normative; [APCA-W3 0.1.9 / 0.0.98G-4g](https://github.com/Myndex/apca-w3) is signed, polarity-aware, supplemental, and experimental. It does not claim conformance with the [work-in-progress WCAG 3 standard](https://www.w3.org/WAI/standards-guidelines/wcag/wcag3-intro/).
+
+Every calculated relationship retains both the unrounded WCAG result and signed APCA Lc so disagreements stay visible. `--method apca` selects APCA as the primary report view but does not invent an APCA conformance threshold; `decisionBasis` identifies WCAG 2.2 wherever pass/fail is present.
 
 ## Audit Gates
 
@@ -100,8 +128,8 @@ Alpha channels are accepted during extraction but ignored for contrast calculati
 
 | Code | Meaning |
 | ---: | --- |
-| `0` | Command succeeded. For `audit` or `check`, every color pair met the selected gate. |
-| `1` | Runtime failure, insufficient colors, no extractable colors, or an audit/check gate failure. |
+| `0` | Command succeeded. For `check`, every calculated normative relationship passed and none needed review. |
+| `1` | Runtime failure, insufficient context, no extractable colors, a failed relationship, or a needs-review result. |
 | `2` | Invalid arguments. |
 
 These exit codes are intended for CI. A failing audit exits with `1`, so a build step can stop when a palette or token file does not meet the selected gate.
@@ -138,6 +166,6 @@ Use `--json` if you want to capture results and render them in a custom report.
 
 ## Current Scope
 
-The CLI is the deterministic repository and CI companion to PaletteWright 2.0. It scans supported source trees, compiles normalized color output, checks contrast with text, JSON, or SARIF reporting, diffs color sets, writes non-destructive repair candidates, and watches folders for changes. The app remains the visual authoring surface for capture, perceptual palette construction, semantic role editing, live component previews, and Figma handoff.
+The CLI is the deterministic repository and CI companion to PaletteWright 2.2. It scans supported source trees, compiles normalized color output, checks declared semantic relationships with text, JSON, or SARIF reporting, diffs color sets, writes non-destructive repair candidates, and watches folders for changes. The app remains the visual authoring surface for capture, perceptual palette construction, semantic role editing, live component previews, and Figma handoff.
 
 The CLI extracts the same text color syntaxes used by PaletteWright's paste, file, and website import paths: hex, RGB, HSL, HWB, Lab/LCH, OKLab/OKLCH, Display-P3, and common structured JSON color objects. It does not evaluate runtime CSS custom-property references, computed browser styles, images, or live websites.

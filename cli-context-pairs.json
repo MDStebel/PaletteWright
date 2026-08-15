@@ -1,0 +1,18 @@
+{
+  "pairs": [
+    {
+      "foreground": "foreground",
+      "background": "background",
+      "usage": "normalText",
+      "modes": ["light"],
+      "states": ["default"]
+    },
+    {
+      "foreground": "foreground",
+      "background": "unknown-surface",
+      "usage": "normalText",
+      "modes": ["light"],
+      "states": ["default"]
+    }
+  ]
+}

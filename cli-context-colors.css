@@ -1,0 +1,5 @@
+:root {
+  --background: color(display-p3 1 1 1);
+  --foreground: rgb(0 0 0 / 60%);
+  --unknown-surface: rgb(20 30 40 / 50%);
+}
