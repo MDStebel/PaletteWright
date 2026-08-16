@@ -20,7 +20,7 @@ swift Tools/palettewright-cli.swift version
 
 ## Commands
 
-The 2.0 workflow commands are:
+The 2.2 workflow commands are:
 
 ```sh
 swift Tools/palettewright-cli.swift scan Sources --json
@@ -38,6 +38,8 @@ Print the CLI version:
 ```sh
 swift Tools/palettewright-cli.swift version
 ```
+
+The regression inputs used by the examples and release checks live in `Tools/Fixtures`. Keep that directory with the public CLI repository so users and CI maintainers can reproduce declared-pair, duplicate-literal, low-contrast, Display-P3, and alpha-context behavior.
 
 Extract unique colors:
 
